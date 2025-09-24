@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>socialsnap</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Initialization
+        setLogLevel('debug');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        let userId = null;
+        let authReady = false;
+
+        const chatMessages = document.getElementById('chat-messages');
+        const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+        const summarizeButton = document.getElementById('summarize-button');
+        const draftButton = document.getElementById('draft-button');
+        const userIdDisplay = document.getElementById('user-id');
+        const appLoading = document.getElementById('app-loading');
+        const appContainer = document.getElementById('app-container');
+        const loadingIndicator = document.getElementById('loading-indicator');
+        const promptModal = document.getElementById('prompt-modal');
+        const closeModal = document.getElementById('close-modal');
+        const modalContent = document.getElementById('modal-content');
+
+        const recipientModal = document.getElementById('recipient-modal');
+        const recipientList = document.getElementById('recipient-list');
+        const closeRecipientModal = document.getElementById('close-recipient-modal');
+        const recipientSearch = document.getElementById('recipient-search');
+
+        // Gemini API Configuration
+        const geminiApiKey = ""; // This will be provided by the runtime
+        const geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${geminiApiKey}`;
+
+        // Simple Encryption/Decryption Function
+        // Warning: This is a very basic encryption method for demonstration.
+        // For a real-world application, a robust library like CryptoJS is recommended.
+        function encryptMessage(text, key) {
+            let result = '';
+            for (let i = 0; i < text.length; i++) {
+                const charCode = text.charCodeAt(i);
+                result += String.fromCharCode(charCode + key);
+            }
+            return result;
+        }
+
+        function decryptMessage(text, key) {
+            let result = '';
+            for (let i = 0; i < text.length; i++) {
+                const charCode = text.charCodeAt(i);
+                result += String.fromCharCode(charCode - key);
+            }
+            return result;
+        }
+
+        const fetchAllUsers = async () => {
+            const usersRef = collection(db, `artifacts/${appId}/public/data/onlineUsers`);
+            const querySnapshot = await getDocs(usersRef);
+            const users = [];
+            querySnapshot.forEach((doc) => {
+                users.push(doc.id);
+            });
+            return users;
+        };
+
+        const displayUsers = (users) => {
+            recipientList.innerHTML = '';
+            users.forEach(uid => {
+                const userElement = document.createElement('li');
+                userElement.className = 'p-3 bg-gray-100 rounded-lg cursor-pointer hover:bg-gray-200 transition-colors';
+                userElement.textContent = uid;
+                userElement.addEventListener('click', () => {
+                    sendMessage(uid);
+                    recipientModal.classList.add('hidden');
+                });
+                recipientList.appendChild(userElement);
+            });
+        };
+
+        const filterUsers = async () => {
+            const users = await fetchAllUsers();
+            const searchTerm = recipientSearch.value.toLowerCase();
+            const filteredUsers = users.filter(uid => uid.toLowerCase().includes(searchTerm));
+            displayUsers(filteredUsers);
+        };
+
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                userId = user.uid;
+                userIdDisplay.textContent = `ইউজার আইডি: ${userId}`;
+                authReady = true;
+                appLoading.classList.add('hidden');
+                appContainer.classList.remove('hidden');
+
+                // Add current user to public list of online users
+                const userDocRef = collection(db, `artifacts/${appId}/public/data/onlineUsers`);
+                await addDoc(userDocRef, { userId: user.uid, timestamp: serverTimestamp() });
+
+                // Listen for messages in the public collection
+                const messagesRef = collection(db, `artifacts/${appId}/public/data/messages`);
+                const q = query(messagesRef, orderBy('timestamp'));
+
+                onSnapshot(q, (querySnapshot) => {
+                    const messages = [];
+                    querySnapshot.forEach((doc) => {
+                        const messageData = doc.data();
+                        messages.push({ id: doc.id, ...messageData });
+                    });
+                    displayMessages(messages);
+                });
+
+            } else {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined') {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                }
+            }
+        });
+
+        const displayMessages = (messages) => {
+            chatMessages.innerHTML = ''; // Clear chat area
+            messages.forEach(msg => {
+                const messageElement = document.createElement('div');
+                const isSentByMe = msg.senderId === userId;
+                const messageKey = msg.recipientId === userId || isSentByMe ? 3 : null;
+
+                const messageText = messageKey ? decryptMessage(msg.text, messageKey) : "মেসেজটি এনক্রিপ্ট করা হয়েছে";
+                const messageClass = isSentByMe ? 'bg-indigo-500 text-white self-end' : 'bg-gray-200 text-gray-800 self-start';
+                const senderName = isSentByMe ? 'আমি' : `ইউজার ${msg.senderId.substring(0, 4)}`;
+
+                messageElement.className = `max-w-xs md:max-w-md p-3 my-2 rounded-2xl shadow-md ${messageClass}`;
+                messageElement.innerHTML = `
+                    <p class="font-bold text-sm">${senderName}</p>
+                    <p>${messageText}</p>
+                `;
+                chatMessages.appendChild(messageElement);
+            });
+            chatMessages.scrollTop = chatMessages.scrollHeight; // Auto-scroll to bottom
+        };
+
+        const sendMessage = async (recipientId) => {
+            if (!authReady || !messageInput.value.trim() || !userId) {
+                return;
+            }
+
+            if (!recipientId) {
+                const users = await fetchAllUsers();
+                displayUsers(users);
+                recipientModal.classList.remove('hidden');
+                return;
+            }
+
+            const messageText = messageInput.value.trim();
+            const encryptedText = encryptMessage(messageText, 3); // Encrypt with key 3
+
+            const messagesRef = collection(db, `artifacts/${appId}/public/data/messages`);
+            try {
+                await addDoc(messagesRef, {
+                    senderId: userId,
+                    recipientId: recipientId,
+                    text: encryptedText,
+                    timestamp: serverTimestamp()
+                });
+                messageInput.value = ''; // Clear input field
+            } catch (e) {
+                console.error("Error adding document: ", e);
+            }
+        };
+
+        const callGeminiAPI = async (prompt) => {
+            loadingIndicator.classList.remove('hidden');
+            let responseText = 'API থেকে কোনো প্রতিক্রিয়া পাওয়া যায়নি।';
+            let retryDelay = 1000;
+            const maxRetries = 5;
+
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const payload = {
+                        contents: [{ parts: [{ text: prompt }] }],
+                    };
+
+                    const response = await fetch(geminiApiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        const result = await response.json();
+                        responseText = result?.candidates?.[0]?.content?.parts?.[0]?.text || responseText;
+                        break; // Success, exit the loop
+                    } else if (response.status === 429) {
+                        console.log(`API rate limit exceeded. Retrying in ${retryDelay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, retryDelay));
+                        retryDelay *= 2; // Exponential backoff
+                    } else {
+                        throw new Error(`API Error: ${response.status} ${response.statusText}`);
+                    }
+                } catch (error) {
+                    console.error("Error calling Gemini API:", error);
+                    responseText = `API কল করতে গিয়ে একটি ত্রুটি হয়েছে: ${error.message}`;
+                    break;
+                }
+            }
+            loadingIndicator.classList.add('hidden');
+            return responseText;
+        };
+
+        const summarizeText = async () => {
+            if (!messageInput.value.trim()) {
+                modalContent.innerHTML = "<p class='text-center text-red-500'>সারসংক্ষেপ করার জন্য কিছু লিখুন।</p>";
+                promptModal.classList.remove('hidden');
+                return;
+            }
+            const prompt = `এই বাংলা টেক্সটটির একটি সংক্ষিপ্ত সারসংক্ষেপ দিন:\n\n${messageInput.value.trim()}`;
+            const summary = await callGeminiAPI(prompt);
+            modalContent.innerHTML = `<h3 class="font-bold text-lg mb-2">সারসংক্ষেপ</h3><p>${summary}</p>`;
+            promptModal.classList.remove('hidden');
+        };
+
+        const draftMessage = async () => {
+            if (!messageInput.value.trim()) {
+                modalContent.innerHTML = "<p class='text-center text-red-500'>খসড়া তৈরি করার জন্য কিছু লিখুন।</p>";
+                promptModal.classList.remove('hidden');
+                return;
+            }
+            const prompt = `এই বিষয়বস্তুটির ওপর ভিত্তি করে একটি আনুষ্ঠানিক বাংলা মেসেজ লিখুন:\n\n${messageInput.value.trim()}`;
+            const draft = await callGeminiAPI(prompt);
+            modalContent.innerHTML = `<h3 class="font-bold text-lg mb-2">খসড়া মেসেজ</h3><p>${draft}</p>`;
+            promptModal.classList.remove('hidden');
+        };
+
+        sendButton.addEventListener('click', () => sendMessage(null));
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                sendMessage(null);
+            }
+        });
+        summarizeButton.addEventListener('click', summarizeText);
+        draftButton.addEventListener('click', draftMessage);
+        closeModal.addEventListener('click', () => {
+            promptModal.classList.add('hidden');
+        });
+        closeRecipientModal.addEventListener('click', () => {
+            recipientModal.classList.add('hidden');
+        });
+        recipientSearch.addEventListener('input', filterUsers);
+        
+    </script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .rounded-2xl { border-radius: 1rem; }
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 50;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 flex flex-col items-center justify-center h-screen p-4">
+
+    <!-- Loading Screen -->
+    <div id="app-loading" class="flex flex-col items-center justify-center">
+        <svg class="animate-spin h-10 w-10 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <p class="mt-4 text-gray-600">socialsnap</p>
+    </div>
+
+    <!-- App Container -->
+    <div id="app-container" class="hidden bg-white p-6 rounded-3xl shadow-lg w-full max-w-lg h-[90vh] flex flex-col transition-opacity duration-500 ease-in-out">
+        <h1 class="text-2xl md:text-3xl font-bold text-center text-gray-800 mb-2">socialsnap</h1>
+        <p id="user-id" class="text-xs text-gray-500 text-center mb-4"></p>
+        <div id="chat-messages" class="flex-1 overflow-y-auto p-4 bg-gray-50 rounded-xl mb-4 flex flex-col gap-2">
+            <!-- Messages will be displayed here -->
+            <p class="text-center text-gray-400">start massaging</p>
+        </div>
+        <div class="flex flex-col gap-2">
+            <textarea id="message-input" placeholder="Write massage..." class="flex-1 p-3 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none h-24"></textarea>
+            <div class="flex justify-between gap-2">
+                <button id="draft-button" class="flex-1 p-3 bg-fuchsia-500 text-white rounded-full shadow-lg hover:bg-fuchsia-600 transition-colors duration-200 flex items-center justify-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.28-8.28zm0 0l-4.264 4.264M6 10h.008v.008H6V10zm.008 4h.008v.008H6v-.008z" />
+                    </svg>
+                    <span>খসড়া✨</span>
+                </button>
+                <button id="summarize-button" class="flex-1 p-3 bg-sky-500 text-white rounded-full shadow-lg hover:bg-sky-600 transition-colors duration-200 flex items-center justify-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+                    </svg>
+                    <span>samarry</span>
+                </button>
+                <button id="send-button" class="p-3 bg-indigo-600 text-white rounded-full shadow-lg hover:bg-indigo-700 transition-colors duration-200">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal for Gemini API responses -->
+    <div id="prompt-modal" class="modal hidden">
+        <div class="bg-white p-6 rounded-3xl shadow-2xl w-full max-w-md relative animate-fade-in-down">
+            <button id="close-modal" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+            <div id="modal-content" class="max-h-[70vh] overflow-y-auto">
+                <!-- Gemini output will be displayed here -->
+            </div>
+            <div id="loading-indicator" class="hidden absolute inset-0 bg-white bg-opacity-75 flex items-center justify-center rounded-3xl">
+                <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for recipient list -->
+    <div id="recipient-modal" class="modal hidden">
+        <div class="bg-white p-6 rounded-3xl shadow-2xl w-full max-w-sm relative">
+            <button id="close-recipient-modal" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+            <h3 class="text-xl font-bold mb-4">প্রাপক নির্বাচন করুন</h3>
+            <input type="text" id="recipient-search" placeholder="আইডি খুঁজুন..." class="w-full p-2 mb-4 rounded-lg border border-gray-300">
+            <ul id="recipient-list" class="max-h-[50vh] overflow-y-auto flex flex-col gap-2">
+                <!-- User IDs will be displayed here -->
+            </ul>
+        </div>
+    </div>
+
+</body>
+</html>
